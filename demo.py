@@ -4,6 +4,7 @@ import pickle
 import unicodedata
 import numpy as np
 import gradio as gr
+import tensorflow as tf
 
 from tensorflow.keras.models import Model, load_model
 from tensorflow.keras.preprocessing.sequence import pad_sequences
@@ -15,15 +16,36 @@ LSTM_UNITS = 64
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Model paths
-ENG_TO_KHM_MODEL_PATH = os.path.join(BASE_DIR, "models", "khmer_transliterator.keras")
-KHM_TO_ENG_MODEL_PATH = os.path.join(BASE_DIR, "models", "english_romanizer.keras")
-ENG_TO_KHM_ASSETS_PATH = os.path.join(BASE_DIR, "data", "processed", "khmer_transliteration_assets.pkl")
-KHM_TO_ENG_ASSETS_PATH = os.path.join(BASE_DIR, "data", "processed", "english_romanization_assets.pkl")
+# LSTM Model paths (from notebooks 01 & 02)
+LSTM_ENG_TO_KHM_MODEL_PATH = os.path.join(BASE_DIR, "models", "khmer_transliterator.keras")
+LSTM_KHM_TO_ENG_MODEL_PATH = os.path.join(BASE_DIR, "models", "english_romanizer.keras")
+LSTM_ENG_TO_KHM_ASSETS_PATH = os.path.join(BASE_DIR, "data", "processed", "khmer_transliteration_assets.pkl")
+LSTM_KHM_TO_ENG_ASSETS_PATH = os.path.join(BASE_DIR, "data", "processed", "english_romanization_assets.pkl")
+
+# Transformer Model paths (from notebooks 04 & 05)
+TRANSFORMER_ENG_TO_KHM_MODEL_PATH = os.path.join(BASE_DIR, "models", "transformer_eng2khm.keras")
+TRANSFORMER_KHM_TO_ENG_MODEL_PATH = os.path.join(BASE_DIR, "models", "transformer_romanizer.keras")
+TRANSFORMER_ENG_TO_KHM_ASSETS_PATH = os.path.join(BASE_DIR, "data", "processed", "transformer_eng2khm_assets.pkl")
+TRANSFORMER_KHM_TO_ENG_ASSETS_PATH = os.path.join(BASE_DIR, "data", "processed", "transformer_romanization_assets.pkl")
+
+class TransformerModel:
+    """Wrapper for transformer transliteration models"""
+    
+    def __init__(self, model_path, assets_path):
+        self.load_assets(assets_path)
+        self.model = tf.keras.models.load_model(model_path)
+    
+    def load_assets(self, assets_path):
+        with open(assets_path, "rb") as f:
+            assets = pickle.load(f)
+        
+        # Store tokenizers and max lengths
+        for key, value in assets.items():
+            setattr(self, key, value)
 
 
 class TransliteratorModel:
-    """Wrapper for seq2seq transliteration models"""
+    """Wrapper for LSTM seq2seq transliteration models"""
     
     def __init__(self, model_path, assets_path, lstm_units=64):
         self.lstm_units = lstm_units
@@ -67,24 +89,38 @@ class TransliteratorModel:
 class BiDirectionalTransliterator:
     """Handles bidirectional transliteration between English and Khmer"""
     
-    def __init__(self):
-        # Load English to Khmer model
-        self.eng_to_khm = TransliteratorModel(
-            ENG_TO_KHM_MODEL_PATH, 
-            ENG_TO_KHM_ASSETS_PATH, 
-            LSTM_UNITS
-        )
-        
-        # Load Khmer to English model
-        self.khm_to_eng = TransliteratorModel(
-            KHM_TO_ENG_MODEL_PATH, 
-            KHM_TO_ENG_ASSETS_PATH, 
-            LSTM_UNITS
-        )
+    def __init__(self, model_type="lstm"):
+        self.model_type = model_type
+        self.load_models(model_type)
+    
+    def load_models(self, model_type):
+        """Load models based on selected type"""
+        if model_type == "lstm":
+            # Load LSTM models
+            self.eng_to_khm = TransliteratorModel(
+                LSTM_ENG_TO_KHM_MODEL_PATH, 
+                LSTM_ENG_TO_KHM_ASSETS_PATH, 
+                LSTM_UNITS
+            )
+            self.khm_to_eng = TransliteratorModel(
+                LSTM_KHM_TO_ENG_MODEL_PATH, 
+                LSTM_KHM_TO_ENG_ASSETS_PATH, 
+                LSTM_UNITS
+            )
+        else:
+            # Load Transformer models
+            self.eng_to_khm = TransformerModel(
+                TRANSFORMER_ENG_TO_KHM_MODEL_PATH,
+                TRANSFORMER_ENG_TO_KHM_ASSETS_PATH
+            )
+            self.khm_to_eng = TransformerModel(
+                TRANSFORMER_KHM_TO_ENG_MODEL_PATH,
+                TRANSFORMER_KHM_TO_ENG_ASSETS_PATH
+            )
     
     def detect_language(self, text):
         """Detect if text is Khmer or English"""
-        # Check for Khmer Unicode characters (U+1780 to U+17FF)
+        # Check for Khmer Unicode characters
         khmer_chars = re.findall(r'[\u1780-\u17FF]', text)
         english_chars = re.findall(r'[a-zA-Z]', text)
         
@@ -102,6 +138,13 @@ class BiDirectionalTransliterator:
         if not text:
             return ""
         
+        if self.model_type == "lstm":
+            return self._lstm_eng_to_khm(text)
+        else:
+            return self._transformer_eng_to_khm(text)
+    
+    def _lstm_eng_to_khm(self, text):
+        """LSTM-based English to Khmer transliteration"""
         # Encode input
         seq = self.eng_to_khm.eng_tokenizer.texts_to_sequences([text])
         encoder_input = pad_sequences(
@@ -134,6 +177,47 @@ class BiDirectionalTransliterator:
         
         return unicodedata.normalize('NFC', ''.join(decoded_chars))
     
+    def _transformer_eng_to_khm(self, text):
+        """Transformer-based English to Khmer transliteration"""
+        # Encode input
+        eng_seq = self.eng_to_khm.eng_tokenizer.texts_to_sequences([text])
+        encoder_input = pad_sequences(eng_seq, maxlen=self.eng_to_khm.max_eng_len, padding='post')
+        
+        # Initialize decoder input with start token
+        decoder_input = np.zeros((1, self.eng_to_khm.max_khm_len + 1), dtype=np.int32)
+        decoder_input[0, 0] = self.eng_to_khm.khm_tokenizer.word_index['\t']
+        
+        # Decode character by character
+        decoded_chars = []
+        
+        for i in range(self.eng_to_khm.max_khm_len):
+            # Predict next character
+            predictions = self.eng_to_khm.model.predict([encoder_input, decoder_input], verbose=0)
+            
+            # Get the character at current position
+            char_index = np.argmax(predictions[0, i, :])
+            
+            # Convert index to character
+            if char_index == 0:
+                # padding token, skip
+                break
+            
+            char = self.eng_to_khm.khm_tokenizer.index_word.get(char_index, '')
+            
+            # Stop if end token
+            if char == '\n':
+                break
+            
+            # Skip special tokens in output
+            if char not in ['\t', '<unk>']:
+                decoded_chars.append(char)
+            
+            # Update decoder input for next position
+            if i + 1 < self.eng_to_khm.max_khm_len + 1:
+                decoder_input[0, i + 1] = char_index
+        
+        return unicodedata.normalize('NFC', ''.join(decoded_chars))
+    
     def transliterate_khm_to_eng(self, text):
         """Transliterate Khmer to English"""
         # Clean input
@@ -144,6 +228,13 @@ class BiDirectionalTransliterator:
         if not text:
             return ""
         
+        if self.model_type == "lstm":
+            return self._lstm_khm_to_eng(text)
+        else:
+            return self._transformer_khm_to_eng(text)
+    
+    def _lstm_khm_to_eng(self, text):
+        """LSTM-based Khmer to English transliteration"""
         # Encode input
         seq = self.khm_to_eng.khm_tokenizer.texts_to_sequences([text])
         encoder_input = pad_sequences(
@@ -176,6 +267,47 @@ class BiDirectionalTransliterator:
         
         return ''.join(decoded_chars)
     
+    def _transformer_khm_to_eng(self, text):
+        """Transformer-based Khmer to English transliteration"""
+        # Encode input
+        khm_seq = self.khm_to_eng.khm_tokenizer.texts_to_sequences([text])
+        encoder_input = pad_sequences(khm_seq, maxlen=self.khm_to_eng.max_khm_len, padding='post')
+        
+        # Initialize decoder input with start token
+        decoder_input = np.zeros((1, self.khm_to_eng.max_eng_len + 1), dtype=np.int32)
+        decoder_input[0, 0] = self.khm_to_eng.eng_tokenizer.word_index['\t']
+        
+        # Decode character by character
+        decoded_chars = []
+        
+        for i in range(self.khm_to_eng.max_eng_len):
+            # Predict next character
+            predictions = self.khm_to_eng.model.predict([encoder_input, decoder_input], verbose=0)
+            
+            # Get the character at current position
+            char_index = np.argmax(predictions[0, i, :])
+            
+            # Convert index to character
+            if char_index == 0:
+                # padding token, skip
+                break
+            
+            char = self.khm_to_eng.eng_tokenizer.index_word.get(char_index, '')
+            
+            # Stop if end token
+            if char == '\n':
+                break
+            
+            # Skip special tokens in output
+            if char not in ['\t', '<unk>']:
+                decoded_chars.append(char)
+            
+            # Update decoder input for next position
+            if i + 1 < self.khm_to_eng.max_eng_len + 1:
+                decoder_input[0, i + 1] = char_index
+        
+        return ''.join(decoded_chars)
+    
     def auto_transliterate(self, text):
         """Automatically detect language and transliterate"""
         if not text or not text.strip():
@@ -185,23 +317,31 @@ class BiDirectionalTransliterator:
         
         if language == "khmer":
             result = self.transliterate_khm_to_eng(text)
-            detected = "Khmer → English"
+            detected = f"Khmer → English ({self.model_type.upper()})"
         else:
             result = self.transliterate_eng_to_khm(text)
-            detected = "English → Khmer"
+            detected = f"English → Khmer ({self.model_type.upper()})"
         
         return result, detected
 
 
-# Initialize the transliterator
-print("Loading models...")
-transliterator = BiDirectionalTransliterator()
-print("Models loaded successfully!")
+# Initialize the transliterator with LSTM by default
+print("Loading LSTM models...")
+transliterator = BiDirectionalTransliterator(model_type="lstm")
+print("LSTM models loaded successfully!")
 
 
 # Gradio interface function
-def translate_text(input_text):
+def translate_text(input_text, model_type):
     """Main function for Gradio interface"""
+    global transliterator
+    
+    # Reload models if model type changed
+    if transliterator.model_type != model_type:
+        print(f"Switching to {model_type.upper()} models...")
+        transliterator = BiDirectionalTransliterator(model_type=model_type)
+        print(f"{model_type.upper()} models loaded successfully!")
+    
     if not input_text or not input_text.strip():
         return "", "No input detected"
     
@@ -218,11 +358,21 @@ with gr.Blocks(title="Khmer ⇄ English Romanization") as demo:
         Enter text in **English** or **Khmer** and the app will automatically detect 
         the language and transliterate it to the other language.
         
+        Choose between **LSTM** or **Transformer** models.
+        
         ### Examples:
         - English → Khmer: `hello`, `trap`, `kdas`
         - Khmer → English: `ហេឡូ`, `ត្រាប`, `ខ្ដាស់`
         """
     )
+    
+    with gr.Row():
+        model_selector = gr.Radio(
+            choices=["lstm", "transformer"],
+            value="lstm",
+            label="Model Type",
+            info="Select the model architecture to use"
+        )
     
     with gr.Row():
         with gr.Column():
@@ -260,14 +410,14 @@ with gr.Blocks(title="Khmer ⇄ English Romanization") as demo:
     # Connect the button
     translate_btn.click(
         fn=translate_text,
-        inputs=input_text,
+        inputs=[input_text, model_selector],
         outputs=[output_text, detection_info]
     )
     
     # Also trigger on Enter key
     input_text.submit(
         fn=translate_text,
-        inputs=input_text,
+        inputs=[input_text, model_selector],
         outputs=[output_text, detection_info]
     )
 
